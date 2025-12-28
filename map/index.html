@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Mapa de Lleida</title>
+
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+
+  <style>
+    body { margin: 0; padding: 0; }
+    #map { width: 100vw; height: 100vh; }
+
+    /* Toggle switch */
+    .switch {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      z-index: 1000;
+      display: inline-block;
+      width: 46px;
+      height: 24px;
+    }
+    .switch input { display: none; }
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-color: #ccc;
+      transition: .4s;
+      border-radius: 24px;
+    }
+    #ubicacion-label {
+      position: absolute;
+      top: 15px;
+      right: 70px;
+      z-index: 1000;
+      font-size: 12px;
+      font-family: sans-serif;
+      background: rgba(255,255,255,0.8);
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 18px;
+      width: 18px;
+      left: 3px;
+      bottom: 3px;
+      background-color: white;
+      transition: .4s;
+      border-radius: 50%;
+    }
+    input:checked + .slider { background-color: #4CAF50; }
+    input:checked + .slider:before { transform: translateX(22px); }
+  </style>
+</head>
+
+<body>
+  <div id="map"></div>
+  <span id="ubicacion-label">Ubicación</span>
+  <label class="switch">
+    <input type="checkbox" id="ubicacion-toggle">
+    <span class="slider"></span>
+  </label>
+
+  <script>
+    function mod(a, m){ return ((a % m) + m) % m; }
+
+    function phaseStartPos(duraciones, idx) {
+      let s = 0;
+      for (let i = 0; i < idx; i++) s += duraciones[i];
+      return s;
+    }
+
+    function obtenerPlanActivo(horario) {
+      const ahora = new Date();
+      const horaActual = ahora.getHours() * 60 + ahora.getMinutes();
+      const diaSemana = ahora.getDay(); // 0=domingo
+      const esFinDeSemana = (diaSemana === 0 || diaSemana === 6);
+      const indicePlan = esFinDeSemana ? 2 : 1;
+
+      let planActivo = horario[0][indicePlan];
+      for (const entrada of horario) {
+        const [horaStr] = entrada;
+        const plan = entrada[indicePlan];
+        const [h, m] = horaStr.split(':').map(Number);
+        const minutos = h * 60 + m;
+        if (horaActual >= minutos) planActivo = plan;
+      }
+      return planActivo;
+    }
+
+    function getZonaAnchor(data, zona, planNum) {
+      const z = data.zonas?.[String(zona)];
+      const a = z?.anchors?.[String(planNum)];
+      return a || null; // {t_unix, phaseIdx} o {baseResidue}
+    }
+
+    function obtenerFaseActual(plan, anchor) {
+      const t = Date.now() / 1000;      // UNIX seconds (float)
+      const ciclo = plan.ciclo;
+      const offsetPlan = plan.offset || 0;
+
+      if (!anchor) return null;
+
+      // anchor puede venir como:
+      //  - {baseResidue: <number in [0,ciclo)>}
+      //  - {t_unix: <unix>, phaseIdx: <idx>}
+      let baseResidue = anchor.baseResidue;
+
+      if (typeof baseResidue !== "number") {
+        const t_anchor = anchor.t_unix;
+        const phaseIdx = anchor.phaseIdx ?? 0;
+        if (typeof t_anchor !== "number") return null;
+
+        const startPos = phaseStartPos(plan.duraciones, phaseIdx);
+        baseResidue = mod(t_anchor + offsetPlan - startPos, ciclo);
+      }
+
+      const pos = mod(t + offsetPlan - baseResidue, ciclo);
+
+      let acc = 0;
+      for (let i = 0; i < plan.duraciones.length; i++) {
+        acc += plan.duraciones[i];
+        if (pos < acc) return i;
+      }
+      return 0;
+    }
+
+    function actualizarColores(map, data) {
+      const vehiculares = [];
+      const peatonales = [];
+      const mostrarIntermitente = Math.floor(Date.now() / 500) % 2 === 0;
+
+      for (const cruceId in data.cruces) {
+        const cruce = data.cruces[cruceId];
+        const planNum = obtenerPlanActivo(cruce.horario);
+        const plan = cruce.planes[String(planNum)];
+        if (!plan) continue;
+
+        const faseIdx = obtenerFaseActual(plan, getZonaAnchor(data, cruce.zona, planNum));
+
+        for (const sem of cruce.semaforos) {
+          let colorRaw = (faseIdx == null) ? '#888' : sem.colores[faseIdx];
+          let color = colorRaw === 'green-intermitent' ? 'green' : colorRaw;
+          let opacity = colorRaw === 'green-intermitent' ? (mostrarIntermitente ? 1 : 0.2) : 1;
+
+          const feature = {
+            type: 'Feature',
+            properties: { color, opacity },
+            geometry: { type: 'Point', coordinates: sem.coords }
+          };
+
+          (sem.type === 'peatonal' ? peatonales : vehiculares).push(feature);
+        }
+      }
+
+      map.getSource('vehiculares')?.setData({ type: 'FeatureCollection', features: vehiculares });
+      map.getSource('peatonales')?.setData({ type: 'FeatureCollection', features: peatonales });
+    }
+
+    const map = new maplibregl.Map({
+      container: 'map',
+      style: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
+      center : [0.629444, 41.623385],
+      zoom: 20
+    //   center : [0.630380, 41.624096],
+    //   zoom: 16.5
+    });
+
+    map.on('load', async function() {
+    //   const response = await fetch('semaforos.json');
+      const response = await fetch('semaforos.json?ts=' + Date.now(), { cache: 'no-store' });
+      const data = await response.json();
+
+      map.addSource('vehiculares', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+      map.addSource('peatonales', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+
+      map.addLayer({
+        id: 'vehiculares-layer',
+        type: 'circle',
+        source: 'vehiculares',
+        paint: {
+          'circle-radius': 7,
+          'circle-color': ['get', 'color'],
+          'circle-stroke-width': 2,
+          'circle-stroke-color': 'white',
+          'circle-opacity': ['get', 'opacity']
+        }
+      });
+
+      map.addLayer({
+        id: 'peatonales-layer',
+        type: 'circle',
+        source: 'peatonales',
+        paint: {
+          'circle-radius': 6,
+          'circle-color': ['get', 'color'],
+          'circle-stroke-width': 3,
+          'circle-stroke-color': '#333',
+          'circle-opacity': ['get', 'opacity']
+        }
+      });
+
+      actualizarColores(map, data);
+      setInterval(() => actualizarColores(map, data), 50);
+
+      // === Ubicación en tiempo real ===
+      let watchId = null;
+
+      map.addSource('mi-ubicacion', {
+        type: 'geojson',
+        data: { type: 'Point', coordinates: [0, 0] }
+      });
+
+      map.addLayer({
+        id: 'mi-ubicacion-layer',
+        type: 'circle',
+        source: 'mi-ubicacion',
+        paint: {
+          'circle-radius': 8,
+          'circle-color': '#4285F4',
+          'circle-stroke-width': 3,
+          'circle-stroke-color': 'white'
+        }
+      });
+
+      // Ocultar inicialmente
+      map.setLayoutProperty('mi-ubicacion-layer', 'visibility', 'none');
+
+      document.getElementById('ubicacion-toggle').addEventListener('change', function() {
+        const ubicacionActiva = this.checked;
+
+        if (ubicacionActiva) {
+          map.setLayoutProperty('mi-ubicacion-layer', 'visibility', 'visible');
+
+          watchId = navigator.geolocation.watchPosition(
+            function(pos) {
+              const coords = [pos.coords.longitude, pos.coords.latitude];
+              map.getSource('mi-ubicacion').setData({
+                type: 'Point',
+                coordinates: coords
+              });
+            },
+            function(err) {
+              console.error('Error de ubicación:', err.message);
+              alert('Error de ubicación: ' + err.message);
+            },
+            { enableHighAccuracy: true }
+          );
+        } else {
+          map.setLayoutProperty('mi-ubicacion-layer', 'visibility', 'none');
+          if (watchId) navigator.geolocation.clearWatch(watchId);
+          watchId = null;
+        }
+      });
+    });
+  </script>
+</body>
+</html>
